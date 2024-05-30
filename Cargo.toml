@@ -2,8 +2,9 @@
 name = "axmem"
 version = "0.1.0"
 edition = "2021"
-keywords = ["Starry"]
-
+authors = ["Youjie Zheng <zyj578335934@gmail.com>"]
+keywords = ["Starry", "address-space"]
+description = "Crates to implement multiple address space abstraction"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
