@@ -122,8 +122,8 @@ impl MapArea {
             return false;
         }
         if self.pages[page_index].is_some() {
-            error!("Page fault in page already loaded");
-            return false;
+            debug!("Page fault in page already loaded");
+            return true;
         }
 
         debug!("page index {}", page_index);
