@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use axalloc::PhysPage;
 use axerrno::AxResult;
 use axhal::{
@@ -6,6 +6,7 @@ use axhal::{
     paging::{MappingFlags, PageSize, PageTable},
 };
 use axio::{Seek, SeekFrom};
+use axsync::Mutex;
 use core::ptr::copy_nonoverlapping;
 
 use crate::MemBackend;
@@ -16,9 +17,11 @@ use crate::MemBackend;
 /// `Clone` trait won't implemented.
 pub struct MapArea {
     /// phys pages of this area
-    pub pages: Vec<Option<PhysPage>>,
+    pub pages: Vec<Option<Arc<Mutex<PhysPage>>>>,
     /// start virtual address
     pub vaddr: VirtAddr,
+    /// shared in child process
+    shared: bool,
     /// mapping flags of this area
     pub flags: MappingFlags,
     /// whether the area is backed by a file
@@ -46,6 +49,7 @@ impl MapArea {
         Self {
             pages,
             vaddr: start,
+            shared: false,
             flags,
             backend,
         }
@@ -60,18 +64,22 @@ impl MapArea {
         backend: Option<MemBackend>,
         page_table: &mut PageTable,
     ) -> AxResult<Self> {
-        let pages = PhysPage::alloc_contiguous(num_pages, PAGE_SIZE_4K, data)?;
+        let pages = PhysPage::alloc_contiguous(num_pages, PAGE_SIZE_4K, data)?
+            .into_iter()
+            .map(|page| page.map(|page| Arc::new(Mutex::new(page))))
+            .collect::<Vec<_>>();
+
         debug!(
             "start: {:X?}, size: {:X},  page start: {:X?} flags: {:?}",
             start,
             num_pages * PAGE_SIZE_4K,
-            pages[0].as_ref().unwrap().start_vaddr,
+            pages[0].as_ref().unwrap().lock().start_vaddr,
             flags
         );
         page_table
             .map_region(
                 start,
-                virt_to_phys(pages[0].as_ref().unwrap().start_vaddr),
+                virt_to_phys(pages[0].as_ref().unwrap().lock().start_vaddr),
                 num_pages * PAGE_SIZE_4K,
                 flags,
                 false,
@@ -80,9 +88,20 @@ impl MapArea {
         Ok(Self {
             pages,
             vaddr: start,
+            shared: false,
             flags,
             backend,
         })
+    }
+
+    /// Set the shared flag of the area.
+    pub(crate) fn set_shared(&mut self, shared: bool) {
+        self.shared = shared;
+    }
+
+    /// Return whether the area is shared in child process.
+    pub(crate) fn is_shared(&self) -> bool {
+        self.shared
     }
 
     /// Deallocate all phys pages and unmap the area in page table.
@@ -164,7 +183,7 @@ impl MapArea {
             .expect("Map in page fault handler failed");
 
         axhal::arch::flush_tlb(addr.align_down_4k().into());
-        self.pages[page_index] = Some(page);
+        self.pages[page_index] = Some(Arc::new(Mutex::new(page)));
         true
     }
 
@@ -180,7 +199,7 @@ impl MapArea {
                     let _ = backend
                         .write_to_seek(
                             SeekFrom::Start((page_index * PAGE_SIZE_4K) as u64),
-                            page.as_slice(),
+                            page.lock().as_slice(),
                         )
                         .unwrap();
                 }
@@ -243,6 +262,7 @@ impl MapArea {
             pages: right_pages,
             vaddr: addr,
             flags: self.flags,
+            shared: self.shared,
             backend: self.backend.as_ref().map(|backend| {
                 let mut backend = backend.clone();
 
@@ -285,6 +305,7 @@ impl MapArea {
             pages: mid_pages,
             vaddr: start,
             flags: self.flags,
+            shared: self.shared,
             backend: self.backend.as_ref().map(|backend| {
                 let mut backend = backend.clone();
 
@@ -302,6 +323,7 @@ impl MapArea {
             pages: right_pages,
             vaddr: end,
             flags: self.flags,
+            shared: self.shared,
             backend: self.backend.as_ref().map(|backend| {
                 let mut backend = backend.clone();
 
@@ -348,6 +370,7 @@ impl MapArea {
             pages,
             vaddr: right_start,
             flags: self.flags,
+            shared: self.shared,
             backend: self.backend.as_ref().map(|backend| {
                 let mut backend = backend.clone();
                 let _ = backend
@@ -395,7 +418,7 @@ impl MapArea {
     pub fn fill(&mut self, byte: u8) {
         self.pages.iter_mut().for_each(|page| {
             if let Some(page) = page {
-                page.fill(byte);
+                page.lock().fill(byte);
             }
         });
     }
@@ -428,9 +451,73 @@ impl MapArea {
             .update_region(self.vaddr, self.size(), flags)
             .unwrap();
     }
-    /// Allocating new phys pages and clone it self.
+    /// # Clone the area.
+    ///
+    /// If the area is shared, we don't need to allocate new phys pages.
+    ///
+    /// If the area is not shared and all the pages have been allocated,
+    /// we can allocate a contiguous area in phys memory.
+    ///
     /// This function will modify the page table as well.
-    pub fn clone_alloc(&self, page_table: &mut PageTable) -> AxResult<Self> {
+    ///
+    /// # Arguments
+    ///
+    /// * `page_table` - The page table of the new child process.
+    ///
+    /// * `parent_page_table` - The page table of the current process.
+    pub fn clone_alloc(
+        &mut self,
+        page_table: &mut PageTable,
+        parent_page_table: &mut PageTable,
+    ) -> AxResult<Self> {
+        // If the area is shared, we don't need to allocate new phys pages.
+        if self.is_shared() {
+            // Allocated all fault page in the parent page table.
+            let fault_pages: Vec<_> = self
+                .pages
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, slot)| {
+                    if slot.is_none() {
+                        Some(self.vaddr + (idx * PAGE_SIZE_4K))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for vaddr in fault_pages {
+                self.handle_page_fault(vaddr, MappingFlags::empty(), parent_page_table);
+            }
+
+            // Map the area in the child page table.
+            let pages: Vec<_> = self
+                .pages
+                .iter()
+                .enumerate()
+                .map(|(idx, slot)| {
+                    let vaddr = self.vaddr + (idx * PAGE_SIZE_4K);
+                    assert!(slot.is_some());
+                    let page = slot.as_ref().unwrap().lock();
+                    page_table
+                        .map(
+                            vaddr,
+                            virt_to_phys(page.start_vaddr),
+                            PageSize::Size4K,
+                            self.flags,
+                        )
+                        .unwrap();
+                    drop(page);
+                    Some(Arc::clone(slot.as_ref().unwrap()))
+                })
+                .collect();
+            return Ok(Self {
+                pages,
+                vaddr: self.vaddr,
+                flags: self.flags,
+                shared: self.shared,
+                backend: self.backend.clone(),
+            });
+        }
         // All the pages have been allocated. Allocate a contiguous area in phys memory.
         if self.allocated() {
             MapArea::new_alloc(
@@ -453,7 +540,7 @@ impl MapArea {
                             let mut new_page = PhysPage::alloc().unwrap();
                             unsafe {
                                 copy_nonoverlapping(
-                                    page.as_ptr(),
+                                    page.lock().as_ptr(),
                                     new_page.as_mut_ptr(),
                                     PAGE_SIZE_4K,
                                 );
@@ -468,7 +555,7 @@ impl MapArea {
                                 )
                                 .unwrap();
 
-                            Some(new_page)
+                            Some(Arc::new(Mutex::new(new_page)))
                         }
                         None => {
                             page_table
@@ -483,6 +570,7 @@ impl MapArea {
                 pages,
                 vaddr: self.vaddr,
                 flags: self.flags,
+                shared: self.shared,
                 backend: self.backend.clone(),
             })
         }

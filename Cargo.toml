@@ -21,6 +21,7 @@ axconfig = { git = "https://github.com/Starry-OS/axconfig.git" }
 axerrno = { git = "https://github.com/Starry-OS/axerrno.git" }
 axfs = { git = "https://github.com/Starry-OS/axfs.git" }
 axio = { git = "https://github.com/Starry-OS/axio.git" }
+axsync = { git = "https://github.com/Starry-OS/axsync.git" }
 spinlock = { git = "https://github.com/Starry-OS/spinlock.git" }
 xmas-elf = "0.9.0"
 riscv = "0.10"

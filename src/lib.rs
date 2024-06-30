@@ -111,13 +111,14 @@ impl MemorySet {
         &mut self,
         vaddr: VirtAddr,
         size: usize,
+        shared: bool,
         flags: MappingFlags,
         data: Option<&[u8]>,
         backend: Option<MemBackend>,
     ) {
         let num_pages = (size + PAGE_SIZE_4K - 1) / PAGE_SIZE_4K;
 
-        let area = match data {
+        let mut area = match data {
             Some(data) => MapArea::new_alloc(
                 vaddr,
                 num_pages,
@@ -147,6 +148,11 @@ impl MemorySet {
             usize::from(area.vaddr) + area.size(),
             flags
         );
+
+        if shared {
+            debug!("The area is shared.");
+            area.set_shared(shared);
+        }
 
         // self.owned_mem.insert(area.vaddr.into(), area);
         assert!(self.owned_mem.insert(area.vaddr.into(), area).is_none());
@@ -260,6 +266,7 @@ impl MemorySet {
         start: VirtAddr,
         size: usize,
         flags: MappingFlags,
+        shared: bool,
         fixed: bool,
         backend: Option<MemBackend>,
     ) -> isize {
@@ -267,10 +274,11 @@ impl MemorySet {
         let size = (size + PAGE_SIZE_4K - 1) / PAGE_SIZE_4K * PAGE_SIZE_4K;
 
         info!(
-            "[mmap] vaddr: [{:?}, {:?}), {:?}, fixed: {}, backend: {}",
+            "[mmap] vaddr: [{:?}, {:?}), {:?}, shared: {}, fixed: {}, backend: {}",
             start,
             start + size,
             flags,
+            shared,
             fixed,
             backend.is_some()
         );
@@ -278,7 +286,7 @@ impl MemorySet {
         let addr = if fixed {
             self.split_for_area(start, size);
 
-            self.new_region(start, size, flags, None, backend);
+            self.new_region(start, size, shared, flags, None, backend);
 
             axhal::arch::flush_tlb(None);
 
@@ -290,7 +298,7 @@ impl MemorySet {
             match start {
                 Some(start) => {
                     info!("found area [{:?}, {:?})", start, start + size);
-                    self.new_region(start, size, flags, None, backend);
+                    self.new_region(start, size, shared, flags, None, backend);
                     flush_tlb(None);
                     start.as_usize() as isize
                 }
@@ -529,6 +537,7 @@ impl MemorySet {
                 self.new_region(
                     start,
                     new_size,
+                    false,
                     MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
                     None,
                     None,
@@ -636,7 +645,7 @@ impl MemorySet {
     /// page table to the new one.
     ///
     /// If it occurs error, the new MemorySet will be dropped and return the error.
-    pub fn clone_or_err(&self) -> AxResult<Self> {
+    pub fn clone_or_err(&mut self) -> AxResult<Self> {
         let mut page_table = PageTable::try_new().expect("Error allocating page table.");
 
         for r in memory_regions() {
@@ -650,9 +659,9 @@ impl MemorySet {
                 .expect("Error mapping kernel memory");
         }
         let mut owned_mem: BTreeMap<usize, MapArea> = BTreeMap::new();
-        for (vaddr, area) in self.owned_mem.iter() {
+        for (vaddr, area) in self.owned_mem.iter_mut() {
             info!("vaddr: {:X?}, new_area: {:X?}", vaddr, area.vaddr);
-            match area.clone_alloc(&mut page_table) {
+            match area.clone_alloc(&mut page_table, &mut self.page_table) {
                 Ok(new_area) => {
                     info!("new area: {:X?}", new_area.vaddr);
                     owned_mem.insert(*vaddr, new_area);
