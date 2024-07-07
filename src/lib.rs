@@ -269,7 +269,7 @@ impl MemorySet {
         shared: bool,
         fixed: bool,
         backend: Option<MemBackend>,
-    ) -> isize {
+    ) -> AxResult<usize> {
         // align up to 4k
         let size = (size + PAGE_SIZE_4K - 1) / PAGE_SIZE_4K * PAGE_SIZE_4K;
 
@@ -283,14 +283,14 @@ impl MemorySet {
             backend.is_some()
         );
 
-        let addr = if fixed {
+        if fixed {
             self.split_for_area(start, size);
 
             self.new_region(start, size, shared, flags, None, backend);
 
             axhal::arch::flush_tlb(None);
 
-            start.as_usize() as isize
+            Ok(start.as_usize())
         } else {
             info!("find free area");
             let start = self.find_free_area(start, size);
@@ -300,15 +300,11 @@ impl MemorySet {
                     info!("found area [{:?}, {:?})", start, start + size);
                     self.new_region(start, size, shared, flags, None, backend);
                     flush_tlb(None);
-                    start.as_usize() as isize
+                    Ok(start.as_usize())
                 }
-                None => -1,
+                None => Err(AxError::NoMemory),
             }
-        };
-
-        debug!("[mmap] return addr: 0x{:x}", addr);
-
-        addr
+        }
     }
 
     /// munmap. You need to flush TLB after this.
