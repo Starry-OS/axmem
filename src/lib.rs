@@ -18,7 +18,7 @@ extern crate log;
 
 use axhal::{
     arch::flush_tlb,
-    mem::{memory_regions, phys_to_virt, PhysAddr, VirtAddr, PAGE_SIZE_4K},
+    mem::{memory_regions, phys_to_virt, MemTraverser, PhysAddr, VirtAddr, PAGE_SIZE_4K},
     paging::{MappingFlags, PageSize, PageTable, PagingError},
 };
 
@@ -74,16 +74,13 @@ impl MemorySet {
     fn new_with_kernel_mapped() -> Self {
         let mut page_table = PageTable::try_new().expect("Error allocating page table.");
 
-        for r in memory_regions() {
-            debug!(
-                "mapping kernel region [0x{:x}, 0x{:x})",
-                usize::from(phys_to_virt(r.paddr)),
-                usize::from(phys_to_virt(r.paddr)) + r.size,
-            );
-            page_table
-                .map_region(phys_to_virt(r.paddr), r.paddr, r.size, r.flags.into(), true)
-                .expect("Error mapping kernel memory");
-        }
+        memory_regions(&MemTraverser{
+            mapper: &|r|{
+                page_table
+                    .map_region(phys_to_virt(r.paddr), r.paddr, r.size, r.flags.into(), true)
+                    .expect("Error mapping kernel memory");
+            },
+        });
 
         Self {
             page_table,
@@ -644,7 +641,8 @@ impl MemorySet {
     pub fn clone_or_err(&mut self) -> AxResult<Self> {
         let mut page_table = PageTable::try_new().expect("Error allocating page table.");
 
-        for r in memory_regions() {
+        memory_regions(&MemTraverser{
+            mapper: &|r|{
             debug!(
                 "mapping kernel region [0x{:x}, 0x{:x})",
                 usize::from(phys_to_virt(r.paddr)),
@@ -653,7 +651,8 @@ impl MemorySet {
             page_table
                 .map_region(phys_to_virt(r.paddr), r.paddr, r.size, r.flags.into(), true)
                 .expect("Error mapping kernel memory");
-        }
+            },
+        });
         let mut owned_mem: BTreeMap<usize, MapArea> = BTreeMap::new();
         for (vaddr, area) in self.owned_mem.iter_mut() {
             info!("vaddr: {:X?}, new_area: {:X?}", vaddr, area.vaddr);
